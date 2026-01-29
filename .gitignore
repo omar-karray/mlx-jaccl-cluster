@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# macOS
+.DS_Store
+
+# Logs / temp
+*.log
+
+# Local hostfiles / secrets
+hostfiles/*.local.json
+*.token
