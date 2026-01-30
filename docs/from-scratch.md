@@ -180,7 +180,19 @@ curl -s http://<rank0-host>:8080/v1/completions \
 
 ---
 
-## 9) Troubleshooting
+## 9) MLX environment variables
+
+These environment variables are passed to all nodes via `mlx.launch --env`:
+
+| Variable | Description |
+|----------|-------------|
+| `MLX_METAL_FAST_SYNCH=1` | **Critical for performance.** Enables fast Metal synchronization. Without this, you may see 5-6x slower inference speeds. |
+| `HF_HUB_OFFLINE=1` | Prevents HuggingFace Hub from attempting to download models. Recommended when using local models. |
+| `TRANSFORMERS_OFFLINE=1` | Prevents transformers library from making network requests. Recommended when using local models. |
+
+---
+
+## 10) Troubleshooting
 
 ### Curl hangs forever
 For sharded distributed inference, **all ranks must enter `generate()` per request**.

@@ -131,6 +131,16 @@ The server script accepts these environment variables:
 | `QUEUE_MAX` | `8` | Max queued requests |
 | `REQ_TIMEOUT` | `120` | Request timeout in seconds |
 
+### MLX environment variables
+
+These environment variables are passed to all nodes via `mlx.launch --env`:
+
+| Variable | Description |
+|----------|-------------|
+| `MLX_METAL_FAST_SYNCH=1` | **Critical for performance.** Enables fast Metal synchronization. Without this, you may see 5-6x slower inference speeds. |
+| `HF_HUB_OFFLINE=1` | Prevents HuggingFace Hub from attempting to download models. Recommended when using local models. |
+| `TRANSFORMERS_OFFLINE=1` | Prevents transformers library from making network requests. Recommended when using local models. |
+
 ---
 
 ## Notes
