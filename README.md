@@ -152,21 +152,21 @@ The `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` flags prevent HuggingFace fr
 3. **Race conditions** — nodes may end up with inconsistent model states
 4. **Unpredictable startup times** — downloading large models can take a long time
 
-**Best practice:** Download models once on rank0, then sync to all nodes:
+**Best practice:** Download models to a visible directory on rank0, then sync to all nodes:
 
 ```bash
-# 1. Download on rank0
-python -c "from mlx_lm import load; load('mlx-community/Qwen3-4B-Instruct-2507-4bit')"
+# 1. Download to a local directory on rank0
+huggingface-cli download mlx-community/Qwen3-4B-Instruct-2507-4bit \
+  --local-dir ~/models_mlx/Qwen3-4B-Instruct-2507-4bit
 
 # 2. Sync to other nodes (reads hosts from your hostfile)
-MODEL_PATH=~/.cache/huggingface/hub/models--mlx-community--Qwen3-4B-Instruct-2507-4bit
+MODEL_PATH=~/models_mlx/Qwen3-4B-Instruct-2507-4bit
 OTHER_HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))[1:]))")
 for h in $OTHER_HOSTS; do
+  ssh "$h" "mkdir -p ~/models_mlx"
   rsync -a --progress "$MODEL_PATH/" "$h:$MODEL_PATH/"
 done
 ```
-
-Or use a shared model directory that exists on all nodes at the same path.
 
 ---
 

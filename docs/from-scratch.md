@@ -92,33 +92,39 @@ Edit `hostfiles/hosts.json`:
 
 ---
 
-## 6) Ensure the model exists on all nodes
+## 6) Download and sync the model to all nodes
 
-If you want to run a model from a local folder, the same path must exist on every node.
+The same model path must exist on every node. Download once on rank0, then sync to other nodes.
 
-Example (adjust for your setup):
+**Download a model from HuggingFace to a local directory:**
 
 ```bash
-# Replace with your actual model path
-MODEL_DIR=~/models_mlx/your-model-name
-
-# Check all nodes have the model
-HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))))")
-for h in $HOSTS; do
-  echo -n "$h: "
-  ssh "$h" "test -d '$MODEL_DIR' && echo OK || echo MISSING"
-done
+# Download to ~/models_mlx (creates the directory if needed)
+huggingface-cli download mlx-community/Qwen3-4B-Instruct-2507-4bit \
+  --local-dir ~/models_mlx/Qwen3-4B-Instruct-2507-4bit
 ```
 
-Copy from rank0 to other nodes if needed:
+**Sync to other nodes:**
 
 ```bash
+MODEL_DIR=~/models_mlx/Qwen3-4B-Instruct-2507-4bit
+
 # Get all hosts except the first one (rank0)
 OTHER_HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))[1:]))")
 
 for h in $OTHER_HOSTS; do
-  ssh "$h" "mkdir -p '$(dirname "$MODEL_DIR")'"
-  rsync -a --progress -e ssh "$MODEL_DIR/" "$h:$MODEL_DIR/"
+  ssh "$h" "mkdir -p ~/models_mlx"
+  rsync -a --progress "$MODEL_DIR/" "$h:$MODEL_DIR/"
+done
+```
+
+**Verify all nodes have the model:**
+
+```bash
+HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))))")
+for h in $HOSTS; do
+  echo -n "$h: "
+  ssh "$h" "test -d '$MODEL_DIR' && echo OK || echo MISSING"
 done
 ```
 
