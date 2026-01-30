@@ -1,0 +1,6 @@
+[
+    {"ssh": "macstudio1.local", "ips": ["192.168.0.36"]},
+    {"ssh": "macstudio2.local", "ips": ["192.168.0.147"]},
+    {"ssh": "macstudio3.local", "ips": ["192.168.0.155"]},
+    {"ssh": "macstudio4.local", "ips": ["192.168.0.100"]}
+]

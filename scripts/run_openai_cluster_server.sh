@@ -5,7 +5,8 @@ set -euo pipefail
 # Settings
 # ---------
 ENV_NAME="${ENV_NAME:-mlxjccl}"
-HOSTFILE="${HOSTFILE:-/Users/alex/Code/mlx-jaccl-cluster/hostfiles/m3-ultra-jaccl.local.json}"
+HOSTFILE="${HOSTFILE:-/Users/alex/Code/mlx-jaccl-cluster/hostfiles/ring-test.json}"
+BACKEND="${BACKEND:-ring}"  # Use 'jaccl' for RDMA when available
 SERVER_PY="${SERVER_PY:-/Users/alex/Code/mlx-jaccl-cluster/server/openai_cluster_server.py}"
 
 MODEL_DIR="${MODEL_DIR:-/Users/alex/models_mlx/mlx-community/Qwen3-4B-Instruct-2507-4bit}"
@@ -30,7 +31,7 @@ done
 # ---------
 # Start
 # ---------
-/Users/alex/miniconda3/bin/conda run -n "$ENV_NAME" mlx.launch --verbose --backend jaccl \
+/Users/alex/miniconda3/bin/conda run -n "$ENV_NAME" mlx.launch --verbose --backend "$BACKEND" \
   --hostfile "$HOSTFILE" \
   --env MLX_METAL_FAST_SYNCH=1 \
   --env HF_HUB_OFFLINE=1 \

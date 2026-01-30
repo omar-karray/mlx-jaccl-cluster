@@ -1,0 +1,22 @@
+[
+    {
+        "ssh": "macstudio2.local",
+        "ips": ["192.168.0.147"],
+        "rdma": [null, "rdma_en5", "rdma_en3", "rdma_en4"]
+    },
+    {
+        "ssh": "macstudio1.local",
+        "ips": [],
+        "rdma": ["rdma_en5", null, "rdma_en4", "rdma_en3"]
+    },
+    {
+        "ssh": "macstudio3.local",
+        "ips": [],
+        "rdma": ["rdma_en3", "rdma_en4", null, "rdma_en5"]
+    },
+    {
+        "ssh": "macstudio4.local",
+        "ips": [],
+        "rdma": ["rdma_en4", "rdma_en3", "rdma_en5", null]
+    }
+]
