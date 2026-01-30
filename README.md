@@ -159,13 +159,12 @@ The `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` flags prevent HuggingFace fr
 huggingface-cli download mlx-community/Qwen3-4B-Instruct-2507-4bit \
   --local-dir ~/models_mlx/Qwen3-4B-Instruct-2507-4bit
 
-# 2. Sync to other nodes (reads hosts from your hostfile)
-MODEL_PATH=~/models_mlx/Qwen3-4B-Instruct-2507-4bit
-OTHER_HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))[1:]))")
-for h in $OTHER_HOSTS; do
-  ssh "$h" "mkdir -p ~/models_mlx"
-  rsync -a --progress "$MODEL_PATH/" "$h:$MODEL_PATH/"
-done
+# 2. Sync to other nodes
+# Note: Use literal paths to avoid zsh parsing issues with host:path syntax
+ssh node2.local "mkdir -p ~/models_mlx"
+rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ node2.local:/Users/yourusername/models_mlx/Qwen3-4B-Instruct-2507-4bit/
+
+# Repeat for each additional node (node3.local, node4.local, etc.)
 ```
 
 ---

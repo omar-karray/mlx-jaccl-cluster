@@ -107,15 +107,17 @@ huggingface-cli download mlx-community/Qwen3-4B-Instruct-2507-4bit \
 **Sync to other nodes:**
 
 ```bash
-MODEL_DIR=~/models_mlx/Qwen3-4B-Instruct-2507-4bit
+# Note: Use literal paths to avoid zsh parsing issues with host:path syntax
+# Replace paths and hostnames with your actual values
 
-# Get all hosts except the first one (rank0)
-OTHER_HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))[1:]))")
+ssh node2.local "mkdir -p ~/models_mlx"
+rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ node2.local:/Users/yourusername/models_mlx/Qwen3-4B-Instruct-2507-4bit/
 
-for h in $OTHER_HOSTS; do
-  ssh "$h" "mkdir -p ~/models_mlx"
-  rsync -a --progress "$MODEL_DIR/" "$h:$MODEL_DIR/"
-done
+ssh node3.local "mkdir -p ~/models_mlx"
+rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ node3.local:/Users/yourusername/models_mlx/Qwen3-4B-Instruct-2507-4bit/
+
+ssh node4.local "mkdir -p ~/models_mlx"
+rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ node4.local:/Users/yourusername/models_mlx/Qwen3-4B-Instruct-2507-4bit/
 ```
 
 **Verify all nodes have the model:**
