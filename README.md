@@ -167,6 +167,8 @@ rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ node2.local:/Users/y
 # Repeat for each additional node (node3.local, node4.local, etc.)
 ```
 
+**Tip:** For large models (100GB+), copying via an external SSD is much faster than rsync over the network.
+
 ---
 
 ## Notes
