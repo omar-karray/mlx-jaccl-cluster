@@ -94,6 +94,12 @@ Rank 0 prints:
 MODEL_DIR=<MODEL_PATH> ./scripts/run_openai_cluster_server.sh
 ```
 
+Or specify a different hostfile (e.g., for a 2-node cluster):
+
+```bash
+MODEL_DIR=<MODEL_PATH> HOSTFILE=hostfiles/hosts-2node.json ./scripts/run_openai_cluster_server.sh
+```
+
 Test:
 
 ```bash
