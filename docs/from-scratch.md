@@ -90,6 +90,12 @@ Edit `hostfiles/hosts.json`:
 ./scripts/verify_cluster.sh
 ```
 
+Or specify a different hostfile:
+
+```bash
+HOSTFILE=hostfiles/hosts-2node.json ./scripts/verify_cluster.sh
+```
+
 ---
 
 ## 6) Download and sync the model to all nodes

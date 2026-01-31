@@ -62,6 +62,12 @@ Edit `hostfiles/hosts.json`:
 ./scripts/verify_cluster.sh
 ```
 
+Or specify a different hostfile (e.g., for a 2-node cluster):
+
+```bash
+HOSTFILE=hostfiles/hosts-2node.json ./scripts/verify_cluster.sh
+```
+
 ### 4) Run a distributed tokens/sec benchmark
 
 ```bash
