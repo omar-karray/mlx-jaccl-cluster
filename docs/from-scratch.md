@@ -10,6 +10,8 @@ For **4 nodes**, JACCL requires a **fully connected mesh**:
 
 - 6 Thunderbolt cables total (every pair directly connected)
 
+![Thunderbolt wiring diagram for 4-Mac cluster](images/figure1.jpeg)
+
 ---
 
 ## 1) Enable RDMA (one-time per Mac)
