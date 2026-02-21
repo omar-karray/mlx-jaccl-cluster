@@ -310,6 +310,42 @@ server: $(MLX_LAUNCH) _resolve-model _guard-mlx ## Start OpenAI-compatible clust
 	REQ_TIMEOUT=$(REQ_TIMEOUT) \
 	./scripts/run_openai_cluster_server.sh
 
+.PHONY: server-bg
+server-bg: $(MLX_LAUNCH) _resolve-model _guard-mlx ## Start server in background (logs → /tmp/mlx-jaccl-cluster.log)
+	@if [ -z "$(MODEL_DIR)" ]; then \
+	  printf "\033[31m  ✗ MODEL or MODEL_DIR is required.\033[0m\n"; \
+	  printf "  Usage: MODEL=mlx-community/Qwen3-8B-4bit make server-bg\n\n"; \
+	  exit 1; \
+	fi
+	@LOG=/tmp/mlx-jaccl-cluster.log; \
+	printf "\n\033[1m  Starting server in background...\033[0m\n"; \
+	printf "  Log file: $$LOG\n\n"; \
+	nohup env \
+	  MODEL_DIR=$(MODEL_DIR) \
+	  HOSTFILE=$(HOSTFILE) \
+	  HTTP_HOST=$(HTTP_HOST) \
+	  HTTP_PORT=$(HTTP_PORT) \
+	  CTRL_PORT=$(CTRL_PORT) \
+	  QUEUE_MAX=$(QUEUE_MAX) \
+	  REQ_TIMEOUT=$(REQ_TIMEOUT) \
+	  ./scripts/run_openai_cluster_server.sh \
+	  > "$$LOG" 2>&1 & \
+	BG_PID=$$!; \
+	printf "  PID: $$BG_PID\n"; \
+	sleep 8; \
+	if kill -0 $$BG_PID 2>/dev/null; then \
+	  printf "\033[1;32m  ✓ Server running in background (PID $$BG_PID)\033[0m\n"; \
+	  printf "  \033[2mTail logs:   make logs\033[0m\n"; \
+	  printf "  \033[2mHealth:      make health\033[0m\n"; \
+	  printf "  \033[2mDashboard:   http://localhost:$(HTTP_PORT)/dashboard\033[0m\n"; \
+	  printf "  \033[2mStop:        make server-stop\033[0m\n\n"; \
+	else \
+	  printf "\033[31m  ✗ Server failed to start. Check $$LOG\033[0m\n"; \
+	  tail -20 "$$LOG"; \
+	  printf "\n"; \
+	  exit 1; \
+	fi
+
 .PHONY: server-stop
 server-stop: ## Stop the cluster server on all nodes
 	@HOSTFILE=$(HOSTFILE) ./scripts/stop_openai_cluster_server.sh
