@@ -5,13 +5,15 @@ set -euo pipefail
 # MLX-JACCL Cluster OpenAI Server Launcher
 # =============================================================================
 # Starts an OpenAI-compatible API server distributed across your MLX cluster.
+# Uses the .venv created by scripts/setup.sh — no conda required.
 #
 # Required:
 #   MODEL_DIR    Path to the MLX model directory (must exist on all nodes)
 #
 # Optional environment variables:
-#   HOSTFILE     Path to cluster hostfile (default: hostfiles/hosts.json)
+#   HOSTFILE     Path to cluster hostfile (default: hostfiles/hosts-2node.json)
 #   MODEL_ID     Model identifier for API responses (default: basename of MODEL_DIR)
+#   VENV_DIR     Path to the virtualenv (default: <repo>/.venv)
 #   HTTP_HOST    HTTP server bind address (default: 0.0.0.0)
 #   HTTP_PORT    HTTP server port (default: 8080)
 #   CTRL_HOST    Coordinator IP for rank0 (default: auto-detect from hostfile)
@@ -19,89 +21,74 @@ set -euo pipefail
 #   QUEUE_MAX    Max queued requests (default: 8)
 #   REQ_TIMEOUT  Request timeout in seconds (default: 120)
 #
-# Example:
-#   MODEL_DIR=/path/to/model ./run_openai_cluster_server.sh
-#   MODEL_DIR=/path/to/model HOSTFILE=/path/to/hosts.json ./run_openai_cluster_server.sh
+# Examples:
+#   MODEL_DIR=/path/to/model ./scripts/run_openai_cluster_server.sh
+#   MODEL_DIR=/path/to/model HOSTFILE=hostfiles/hosts-2node.json ./scripts/run_openai_cluster_server.sh
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
-# ---------
-# Required settings
-# ---------
+# ── Colours ──────────────────────────────────────────────────────────────────
+_c()    { printf "\033[%sm%s\033[0m\n" "$1" "$2"; }
+info()  { _c "36" "  → $*"; }
+error() { _c "31" "  ✗ $*"; exit 1; }
+
+# ── Required: MODEL_DIR ──────────────────────────────────────────────────────
 if [[ -z "${MODEL_DIR:-}" ]]; then
-  echo "ERROR: MODEL_DIR is required. Set it to the path of your MLX model."
-  echo "Example: MODEL_DIR=/path/to/model ./run_openai_cluster_server.sh"
-  exit 1
+  error "MODEL_DIR is required.\n  Example: MODEL_DIR=/path/to/model ./scripts/run_openai_cluster_server.sh"
 fi
 
 if [[ ! -d "$MODEL_DIR" ]]; then
-  echo "ERROR: MODEL_DIR does not exist: $MODEL_DIR"
-  exit 1
+  error "MODEL_DIR does not exist: $MODEL_DIR"
 fi
 
-# ---------
-# Settings with defaults
-# ---------
-HOSTFILE="${HOSTFILE:-$REPO_DIR/hostfiles/hosts.json}"
+# ── Defaults ─────────────────────────────────────────────────────────────────
+VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv}"
+HOSTFILE="${HOSTFILE:-$REPO_DIR/hostfiles/hosts-2node.json}"
 SERVER_PY="${SERVER_PY:-$REPO_DIR/server/openai_cluster_server.py}"
 
 MODEL_ID="${MODEL_ID:-$(basename "$MODEL_DIR")}"
-
 HTTP_HOST="${HTTP_HOST:-0.0.0.0}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 CTRL_PORT="${CTRL_PORT:-18080}"
 QUEUE_MAX="${QUEUE_MAX:-8}"
 REQ_TIMEOUT="${REQ_TIMEOUT:-120}"
 
-# ---------
-# Validate paths
-# ---------
+# ── Validate paths ────────────────────────────────────────────────────────────
+if [[ ! -d "$VENV_DIR" ]]; then
+  error ".venv not found at $VENV_DIR\n  Run: ./scripts/setup.sh"
+fi
+
+MLX_LAUNCH="$VENV_DIR/bin/mlx.launch"
+if [[ ! -f "$MLX_LAUNCH" ]]; then
+  error "mlx.launch not found at $MLX_LAUNCH\n  Run: ./scripts/setup.sh"
+fi
+
 if [[ ! -f "$HOSTFILE" ]]; then
-  echo "ERROR: Hostfile not found: $HOSTFILE"
-  echo "Create a hostfile or set HOSTFILE=/path/to/your/hostfile.json"
-  exit 1
+  error "Hostfile not found: $HOSTFILE\n  Set HOSTFILE= or edit hostfiles/hosts-2node.json"
 fi
 
 if [[ ! -f "$SERVER_PY" ]]; then
-  echo "ERROR: Server script not found: $SERVER_PY"
-  exit 1
+  error "Server script not found: $SERVER_PY"
 fi
 
-# ---------
-# Check uv is available
-# ---------
-if ! command -v uv &>/dev/null; then
-  echo "ERROR: uv not found. Install it with: brew install uv"
-  exit 1
-fi
-
-# ---------
-# Auto-detect CTRL_HOST from hostfile if not set
-# ---------
+# ── Auto-detect CTRL_HOST from rank0's ips[] in hostfile ─────────────────────
 if [[ -z "${CTRL_HOST:-}" ]]; then
   CTRL_HOST=$(python3 -c "
-import json, sys
+import json
 with open('$HOSTFILE') as f:
     hosts = json.load(f)
 ips = hosts[0].get('ips', [])
-if ips:
-    print(ips[0])
-else:
-    print('')
+print(ips[0] if ips else '')
 " 2>/dev/null || echo "")
 
   if [[ -z "$CTRL_HOST" ]]; then
-    echo "ERROR: Could not auto-detect CTRL_HOST from hostfile."
-    echo "Set CTRL_HOST to the LAN IP of rank0 (first host in hostfile)."
-    exit 1
+    error "Could not auto-detect CTRL_HOST from hostfile.\n  Set CTRL_HOST to the LAN IP of rank0 (first entry in hostfile)."
   fi
 fi
 
-# ---------
-# Extract hosts from hostfile for cleanup
-# ---------
+# ── Extract SSH host list for pre-flight cleanup ──────────────────────────────
 HOSTS=$(python3 -c "
 import json
 with open('$HOSTFILE') as f:
@@ -109,34 +96,33 @@ with open('$HOSTFILE') as f:
 print(' '.join(h['ssh'] for h in hosts))
 " 2>/dev/null || echo "")
 
-# ---------
-# Print configuration
-# ---------
-echo "=== MLX-JACCL Cluster Server ==="
-echo "Model:      $MODEL_DIR"
-echo "Model ID:   $MODEL_ID"
-echo "Hostfile:   $HOSTFILE"
-echo "Hosts:      $HOSTS"
-echo "Ctrl Host:  $CTRL_HOST:$CTRL_PORT"
-echo "HTTP:       $HTTP_HOST:$HTTP_PORT"
-echo "================================"
-echo
+# ── Print configuration ───────────────────────────────────────────────────────
+echo ""
+printf "\033[1m%s\033[0m\n" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+printf "\033[1m%s\033[0m\n" "  MLX-JACCL Cluster Server"
+printf "\033[1m%s\033[0m\n" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+info "Model      : $MODEL_DIR"
+info "Model ID   : $MODEL_ID"
+info "Hostfile   : $HOSTFILE"
+info "Hosts      : $HOSTS"
+info "Ctrl       : $CTRL_HOST:$CTRL_PORT"
+info "HTTP       : $HTTP_HOST:$HTTP_PORT"
+info "venv       : $VENV_DIR"
+info "mlx.launch : $MLX_LAUNCH"
+echo ""
 
-# ---------
-# Stop any old copies on cluster nodes
-# ---------
+# ── Stop any stale server processes on all nodes ──────────────────────────────
 if [[ -n "$HOSTS" ]]; then
   echo "Stopping any existing server processes..."
   for h in $HOSTS; do
-    ssh "$h" 'pkill -f openai_cluster_server.py || true' 2>/dev/null || true
+    ssh "$h" 'pkill -f openai_cluster_server.py 2>/dev/null || true' 2>/dev/null || true
   done
+  echo ""
 fi
 
-# ---------
-# Start the server via uv run + mlx.launch
-# ---------
+# ── Launch ────────────────────────────────────────────────────────────────────
 echo "Starting cluster server..."
-uv run mlx.launch --verbose --backend jaccl \
+"$MLX_LAUNCH" --verbose --backend jaccl \
   --hostfile "$HOSTFILE" \
   --env MLX_METAL_FAST_SYNCH=1 \
   --env HF_HUB_OFFLINE=1 \
@@ -149,4 +135,4 @@ uv run mlx.launch --verbose --backend jaccl \
   --env CTRL_PORT="$CTRL_PORT" \
   --env QUEUE_MAX="$QUEUE_MAX" \
   --env REQ_TIMEOUT="$REQ_TIMEOUT" -- \
-  "$SERVER_PY"
+  python "$SERVER_PY"
