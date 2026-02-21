@@ -149,6 +149,7 @@ echo "Starting cluster server..."
   --env TRANSFORMERS_OFFLINE=1 \
   --env PYTHONPATH="$REPO_DIR/server" \
   --env MODEL_DIR="$MODEL_DIR" \
+  --env HOSTFILE="$HOSTFILE" \
   --env RDMA_DEVICES="$RDMA_DEVICES" \
   --env MODEL_ID="$MODEL_ID" \
   --env HOST="$HTTP_HOST" \

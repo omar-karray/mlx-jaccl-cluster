@@ -844,6 +844,8 @@ def _mount_dashboard_now() -> None:
         # Default: both nodes use rdma_en4 (confirmed working on M4 Pro)
         rdma_devices = ["rdma_en4"] * (_world.size() if _world else 2)
 
+    hostfile = os.environ.get("HOSTFILE", "")
+
     mount_dashboard(
         app,
         get_state=lambda: {},
@@ -855,6 +857,7 @@ def _mount_dashboard_now() -> None:
         rdma_devices=rdma_devices,
         host=HOST,
         port=PORT,
+        hostfile=hostfile,
     )
     print(
         f"[rank0] dashboard mounted at http://{HOST if HOST != '0.0.0.0' else 'localhost'}:{PORT}/dashboard",
