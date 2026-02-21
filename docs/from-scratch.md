@@ -1,6 +1,6 @@
-# From-scratch: 4-Mac MLX JACCL (Thunderbolt RDMA) Cluster
+# From-scratch: Multi-Mac MLX JACCL (Thunderbolt RDMA) Cluster
 
-This guide sets up a 4‑Mac, fully connected Thunderbolt mesh using **MLX JACCL** (RDMA over Thunderbolt) and runs distributed jobs via `mlx.launch --backend jaccl`.
+This guide sets up a multi‑Mac, fully connected Thunderbolt mesh using **MLX JACCL** (RDMA over Thunderbolt) and runs distributed jobs via `mlx.launch --backend jaccl`.
 
 ---
 
@@ -9,6 +9,10 @@ This guide sets up a 4‑Mac, fully connected Thunderbolt mesh using **MLX JACCL
 For **4 nodes**, JACCL requires a **fully connected mesh**:
 
 - 6 Thunderbolt cables total (every pair directly connected)
+
+For **2 nodes**:
+
+- 1 Thunderbolt cable directly between the two Macs
 
 ![Thunderbolt wiring diagram for 4-Mac cluster](images/figure1.jpeg)
 
@@ -34,24 +38,54 @@ You should see `rdma_en*` devices (e.g. `rdma_en3`, `rdma_en4`, `rdma_en5`).
 
 ---
 
-## 2) Create the conda env and install MLX
+## 2) Install uv and set up the Python environment
+
+This project uses [uv](https://github.com/astral-sh/uv) instead of conda — it is faster, lighter, and requires no extra tool beyond Homebrew.
 
 Do this on **each** Mac:
 
-```bash
-conda create -n mlxjccl python=3.12 -y
-conda activate mlxjccl
+### Install uv (if not already installed)
 
-python -m pip install -U pip setuptools wheel
-python -m pip install -U "mlx>=0.30.4" "mlx-lm==0.30.5" fastapi uvicorn
-python -m pip install -U "transformers==5.0.0rc3" tokenizers mistral_common
+```bash
+brew install uv
 ```
 
-Verify:
+### Run the one-shot setup script
+
+From the repo root:
 
 ```bash
-python -m pip show mlx mlx-lm transformers | egrep "Name|Version"
-mlx.distributed_config -h | grep -i jaccl || true
+./scripts/setup.sh
+```
+
+This will:
+- Create a `.venv` virtualenv in the repo root (Python 3.12)
+- Install all dependencies: `mlx`, `mlx-lm`, `fastapi`, `uvicorn`, `transformers`, `tokenizers`, `mistral_common`, `huggingface_hub`
+- Verify all packages are importable
+- Check for RDMA devices
+
+### Manual install (alternative)
+
+If you prefer to do it step by step:
+
+```bash
+# Create virtualenv
+uv venv .venv --python 3.12
+
+# Activate
+source .venv/bin/activate
+
+# Install dependencies
+uv pip install "mlx>=0.30.4" "mlx-lm>=0.30.5"
+uv pip install "fastapi>=0.110.0" "uvicorn[standard]>=0.29.0" "pydantic>=2.0"
+uv pip install "transformers>=4.50.0" tokenizers mistral_common "huggingface_hub[cli]"
+```
+
+### Verify
+
+```bash
+source .venv/bin/activate
+python -m pip show mlx mlx-lm transformers | grep -E "Name|Version"
 ```
 
 ---
@@ -70,17 +104,21 @@ ipconfig getifaddr en0
 
 ## 4) Create a JACCL hostfile
 
-Copy the template:
+Copy the appropriate template:
 
 ```bash
+# For 2 nodes:
+cp hostfiles/hosts-2node.json hostfiles/hosts.json
+
+# For 4 nodes:
 cp hostfiles/hosts.json.example hostfiles/hosts.json
 ```
 
 Edit `hostfiles/hosts.json`:
 
-- set `ssh` hostnames (e.g. `node1.local`, `node2.local`, …)
+- set `ssh` hostnames (e.g. `mac1.local`, `mac2.local`, …)
 - set rank0 `"ips": ["<rank0_lan_ip>"]`
-- keep the `rdma` matrix consistent with your wiring
+- keep the `rdma` matrix consistent with your wiring (use `ibv_devices` to find device names)
 
 > `hostfiles/hosts.json` is ignored by git.
 
@@ -89,25 +127,56 @@ Edit `hostfiles/hosts.json`:
 ## 5) Verify the cluster
 
 ```bash
-./scripts/verify_cluster.sh
+HOSTFILE=hostfiles/hosts-2node.json ./scripts/verify_cluster.sh
 ```
 
-Or specify a different hostfile:
+This checks:
+- SSH connectivity to each node
+- RDMA devices present on each node (`ibv_devices`)
+
+> Note: this does **not** send data over RDMA. It only checks SSH + device presence.
+
+---
+
+## 6) Test RDMA data transfer (no model needed)
+
+Run the minimal RDMA test to confirm actual data flows over Thunderbolt between both Macs:
 
 ```bash
-HOSTFILE=hostfiles/hosts-2node.json ./scripts/verify_cluster.sh
+uv run mlx.launch --backend jaccl \
+  --hostfile hostfiles/hosts-2node.json \
+  --env MLX_METAL_FAST_SYNCH=1 -- \
+  python scripts/rdma_test.py
+```
+
+Expected output on rank0:
+- **Phase 0**: barrier smoke test (all ranks reached barrier)
+- **Phase 1**: correctness check on `all_sum` results
+- **Phase 2**: latency of a 1-element all_sum in µs
+- **Phase 3**: bandwidth sweep across tensor sizes with GB/s readings
+
+A healthy TB5 RDMA link should show **> 5 GB/s** peak bandwidth.
+
+Optional env vars:
+```bash
+RDMA_ROUNDS=50 RDMA_VERBOSE=1 uv run mlx.launch --backend jaccl \
+  --hostfile hostfiles/hosts-2node.json \
+  --env MLX_METAL_FAST_SYNCH=1 -- \
+  python scripts/rdma_test.py
 ```
 
 ---
 
-## 6) Download and sync the model to all nodes
+## 7) Download and sync the model to all nodes
 
 The same model path must exist on every node. Download once on rank0, then sync to other nodes.
 
 **Download a model from HuggingFace to a local directory:**
 
 ```bash
-# Download to ~/models_mlx (creates the directory if needed)
+# Activate the venv first
+source .venv/bin/activate
+
 huggingface-cli download mlx-community/Qwen3-4B-Instruct-2507-4bit \
   --local-dir ~/models_mlx/Qwen3-4B-Instruct-2507-4bit
 ```
@@ -115,17 +184,10 @@ huggingface-cli download mlx-community/Qwen3-4B-Instruct-2507-4bit \
 **Sync to other nodes:**
 
 ```bash
-# Note: Use literal paths to avoid zsh parsing issues with host:path syntax
 # Replace paths and hostnames with your actual values
-
-ssh node2.local "mkdir -p ~/models_mlx"
-rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ node2.local:/Users/yourusername/models_mlx/Qwen3-4B-Instruct-2507-4bit/
-
-ssh node3.local "mkdir -p ~/models_mlx"
-rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ node3.local:/Users/yourusername/models_mlx/Qwen3-4B-Instruct-2507-4bit/
-
-ssh node4.local "mkdir -p ~/models_mlx"
-rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ node4.local:/Users/yourusername/models_mlx/Qwen3-4B-Instruct-2507-4bit/
+ssh mac2.local "mkdir -p ~/models_mlx"
+rsync -avz -e ssh ~/models_mlx/Qwen3-4B-Instruct-2507-4bit/ \
+  mac2.local:/Users/yourusername/models_mlx/Qwen3-4B-Instruct-2507-4bit/
 ```
 
 **Verify all nodes have the model:**
@@ -138,12 +200,14 @@ for h in $HOSTS; do
 done
 ```
 
+> **Tip:** For large models (100GB+), copying via an external SSD is much faster than rsync over the network.
+
 ---
 
-## 7) Run the distributed tokens/sec benchmark
+## 8) Run the distributed tokens/sec benchmark
 
 ```bash
-conda run -n mlxjccl mlx.launch --verbose --backend jaccl \
+uv run mlx.launch --verbose --backend jaccl \
   --hostfile hostfiles/hosts.json \
   --env MLX_METAL_FAST_SYNCH=1 \
   --env HF_HUB_OFFLINE=1 \
@@ -154,16 +218,15 @@ conda run -n mlxjccl mlx.launch --verbose --backend jaccl \
   --max-tokens 256
 ```
 
-Rank0 prints tokens/sec.
+Rank0 prints `prompt_tokens`, `gen_tokens`, `seconds`, `tokens_per_sec`.
 
 ---
 
-## 8) Run the OpenAI-compatible server
+## 9) Run the OpenAI-compatible server
 
 Start:
 
 ```bash
-# Replace with your actual model path
 MODEL_DIR=~/models_mlx/your-model-name ./scripts/run_openai_cluster_server.sh
 ```
 
@@ -172,7 +235,7 @@ Or with custom settings:
 ```bash
 MODEL_DIR=~/models_mlx/your-model-name \
 HTTP_PORT=8000 \
-HOSTFILE=hostfiles/my-cluster.json \
+HOSTFILE=hostfiles/hosts-2node.json \
 ./scripts/run_openai_cluster_server.sh
 ```
 
@@ -198,15 +261,15 @@ curl -s http://<rank0-host>:8080/v1/completions \
 
 ---
 
-## 9) MLX environment variables
+## 10) MLX environment variables
 
 These environment variables are passed to all nodes via `mlx.launch --env`:
 
 | Variable | Description |
 |----------|-------------|
 | `MLX_METAL_FAST_SYNCH=1` | **Critical for performance.** Enables fast Metal synchronization. Without this, you may see 5-6x slower inference speeds. |
-| `HF_HUB_OFFLINE=1` | **Prevents automatic model downloads.** See below. |
-| `TRANSFORMERS_OFFLINE=1` | **Prevents automatic model downloads.** See below. |
+| `HF_HUB_OFFLINE=1` | **Prevents automatic model downloads.** |
+| `TRANSFORMERS_OFFLINE=1` | **Prevents automatic model downloads.** |
 
 ### Why use offline mode?
 
@@ -217,21 +280,28 @@ The `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` flags prevent HuggingFace fr
 3. **Race conditions** — nodes may end up with inconsistent model states
 4. **Unpredictable startup times** — downloading large models can take a long time
 
-Without these flags, if you specify a model that doesn't exist locally (e.g., `mlx-community/Qwen3-4B`), each node will attempt to download it from HuggingFace Hub independently.
-
-**Best practice:** Always download models once on rank0, then sync to all other nodes (see step 6 above), and run with offline mode enabled.
+**Best practice:** Always download models once on rank0, then sync to all other nodes (see step 7 above), and run with offline mode enabled.
 
 ---
 
-## 10) Troubleshooting
+## 11) Troubleshooting
 
 ### Curl hangs forever
+
 For sharded distributed inference, **all ranks must enter `generate()` per request**.
 
 - Confirm all nodes are running the server (rank0 + workers)
 - Confirm the server control-plane port is reachable (`CTRL_PORT`)
 
+### RDMA test fails / low bandwidth
+
+- Confirm `rdma_ctl enable` was run in Recovery on **both** Macs
+- Run `ibv_devices` on each Mac — you must see `rdma_en*` entries
+- Confirm the Thunderbolt cable is seated properly
+- Try `MLX_METAL_FAST_SYNCH=1` — without it bandwidth will appear 5-6x lower
+
 ### Unexpected HF downloads
+
 Pass offline env vars via `mlx.launch --env`:
 
 - `HF_HUB_OFFLINE=1`
@@ -245,6 +315,14 @@ Pass offline env vars via `mlx.launch --env`:
 # If needed, also kill any other MLX processes:
 HOSTS=$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('hostfiles/hosts.json'))))")
 for h in $HOSTS; do
-  ssh "$h" 'pkill -f "python.*-m mlx_lm" || true'
+  ssh "$h" 'pkill -f "python.*mlx" || true'
 done
+```
+
+### Re-run setup after dependency changes
+
+```bash
+# Remove old venv and start fresh
+rm -rf .venv
+./scripts/setup.sh
 ```

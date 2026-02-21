@@ -12,7 +12,6 @@ set -euo pipefail
 # Optional environment variables:
 #   HOSTFILE     Path to cluster hostfile (default: hostfiles/hosts.json)
 #   MODEL_ID     Model identifier for API responses (default: basename of MODEL_DIR)
-#   ENV_NAME     Conda environment name (default: mlxjccl)
 #   HTTP_HOST    HTTP server bind address (default: 0.0.0.0)
 #   HTTP_PORT    HTTP server port (default: 8080)
 #   CTRL_HOST    Coordinator IP for rank0 (default: auto-detect from hostfile)
@@ -25,7 +24,6 @@ set -euo pipefail
 #   MODEL_DIR=/path/to/model HOSTFILE=/path/to/hosts.json ./run_openai_cluster_server.sh
 # =============================================================================
 
-# Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -46,11 +44,9 @@ fi
 # ---------
 # Settings with defaults
 # ---------
-ENV_NAME="${ENV_NAME:-mlxjccl}"
 HOSTFILE="${HOSTFILE:-$REPO_DIR/hostfiles/hosts.json}"
 SERVER_PY="${SERVER_PY:-$REPO_DIR/server/openai_cluster_server.py}"
 
-# Default MODEL_ID to the basename of MODEL_DIR
 MODEL_ID="${MODEL_ID:-$(basename "$MODEL_DIR")}"
 
 HTTP_HOST="${HTTP_HOST:-0.0.0.0}"
@@ -74,10 +70,17 @@ if [[ ! -f "$SERVER_PY" ]]; then
 fi
 
 # ---------
+# Check uv is available
+# ---------
+if ! command -v uv &>/dev/null; then
+  echo "ERROR: uv not found. Install it with: brew install uv"
+  exit 1
+fi
+
+# ---------
 # Auto-detect CTRL_HOST from hostfile if not set
 # ---------
 if [[ -z "${CTRL_HOST:-}" ]]; then
-  # Extract the first IP from the first host's "ips" array
   CTRL_HOST=$(python3 -c "
 import json, sys
 with open('$HOSTFILE') as f:
@@ -86,7 +89,6 @@ ips = hosts[0].get('ips', [])
 if ips:
     print(ips[0])
 else:
-    # Fallback: try to get IP of first host via ssh hostname
     print('')
 " 2>/dev/null || echo "")
 
@@ -131,10 +133,10 @@ if [[ -n "$HOSTS" ]]; then
 fi
 
 # ---------
-# Start the server
+# Start the server via uv run + mlx.launch
 # ---------
 echo "Starting cluster server..."
-conda run -n "$ENV_NAME" mlx.launch --verbose --backend jaccl \
+uv run mlx.launch --verbose --backend jaccl \
   --hostfile "$HOSTFILE" \
   --env MLX_METAL_FAST_SYNCH=1 \
   --env HF_HUB_OFFLINE=1 \

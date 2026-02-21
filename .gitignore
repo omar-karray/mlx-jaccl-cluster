@@ -16,4 +16,7 @@ venv/
 # Local hostfiles / secrets
 hostfiles/*.local.json
 hostfiles/hosts.json
+.venv/
+__pycache__/
+*.pyc
 *.token

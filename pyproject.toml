@@ -1,0 +1,28 @@
+[project]
+name = "mlx-jaccl-cluster"
+version = "0.1.0"
+description = "Multi-Mac MLX cluster using JACCL (RDMA over Thunderbolt) with OpenAI-compatible server"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx>=0.30.4",
+    "mlx-lm==0.30.5",
+    "fastapi",
+    "uvicorn",
+    "transformers==5.0.0rc3",
+    "tokenizers",
+    "mistral_common",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipython",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "ipython",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
