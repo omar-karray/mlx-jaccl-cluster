@@ -33,6 +33,7 @@ RDMA_MAX_MB  ?= 256
 
 # ── Server defaults ──────────────────────────────────────────────────────────
 MODEL_DIR    ?=
+MODEL        ?=
 HTTP_HOST    ?= 0.0.0.0
 HTTP_PORT    ?= 8080
 CTRL_PORT    ?= 18080
@@ -56,6 +57,70 @@ MODELS_DIR   ?= $(HOME)/models_mlx
 
 # ── Monitor defaults ─────────────────────────────────────────────────────
 MONITOR_INTERVAL ?= 5
+
+# ── Hardware monitor defaults ────────────────────────────────────────────────
+MACMON_INTERVAL ?= 1000
+
+# =============================================================================
+# Guards & Memory
+# =============================================================================
+
+# _guard-mlx: warn and auto-kill if MLX processes are already running.
+# Called automatically by bench/server so you never stack model loads.
+.PHONY: _guard-mlx
+_guard-mlx:
+	@RUNNING=0; \
+	if [ -f "$(HOSTFILE)" ]; then \
+	  HOSTS=$$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('$(HOSTFILE)'))))"); \
+	  for h in $$HOSTS; do \
+	    C=$$(ssh "$$h" 'pgrep -cf "$(_MLX_KILL_PAT)" 2>/dev/null || echo 0'); \
+	    if [ "$$C" != "0" ] && [ -n "$$C" ]; then RUNNING=$$((RUNNING + C)); fi; \
+	  done; \
+	fi; \
+	if [ "$$RUNNING" -gt 0 ]; then \
+	  printf "\n\033[33m  ⚠  %s MLX process(es) already running — cleaning up first...\033[0m\n" "$$RUNNING"; \
+	  $(MAKE) --no-print-directory kill-all; \
+	fi
+
+# _resolve-model: if MODEL is set but MODEL_DIR is not, derive MODEL_DIR from MODEL.
+#   MODEL=mlx-community/Qwen3-8B-4bit  →  MODEL_DIR=~/models_mlx/Qwen3-8B-4bit
+# This lets you write:  MODEL=mlx-community/Qwen3-8B-4bit make bench
+# instead of:           MODEL_DIR=~/models_mlx/Qwen3-8B-4bit make bench
+.PHONY: _resolve-model
+_resolve-model:
+ifneq ($(MODEL),)
+ifeq ($(MODEL_DIR),)
+	$(eval MODEL_DIR := $(MODELS_DIR)/$(lastword $(subst /, ,$(MODEL))))
+	@printf "  \033[2mMODEL=$(MODEL) → MODEL_DIR=$(MODEL_DIR)\033[0m\n"
+endif
+endif
+
+.PHONY: mem
+mem: ## Quick memory check across all nodes (no process kill)
+	@printf "\n\033[1m  Memory — all nodes\033[0m\n\n"
+	@if [ -f "$(HOSTFILE)" ]; then \
+	  HOSTS=$$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('$(HOSTFILE)'))))"); \
+	  for h in $$HOSTS; do \
+	    printf "  → %-22s " "$$h"; \
+	    FREE=$$(ssh "$$h" 'vm_stat 2>/dev/null | awk "/Pages free/ {gsub(/\\./, \"\"); printf \"%.1f\", \$$3 * 16384 / 1073741824}"' 2>/dev/null); \
+	    TOTAL=$$(ssh "$$h" 'sysctl -n hw.memsize 2>/dev/null | awk "{printf \"%.0f\", \$$1 / 1073741824}"' 2>/dev/null); \
+	    PROCS=$$(ssh "$$h" 'pgrep -cf "$(_MLX_KILL_PAT)" 2>/dev/null || echo 0'); \
+	    if [ -n "$$FREE" ] && [ -n "$$TOTAL" ]; then \
+	      printf "free: %s GB / %s GB" "$$FREE" "$$TOTAL"; \
+	      if [ "$$PROCS" != "0" ] && [ -n "$$PROCS" ]; then \
+	        printf "  \033[33m(%s MLX proc)\033[0m" "$$PROCS"; \
+	      else \
+	        printf "  \033[32m(idle)\033[0m"; \
+	      fi; \
+	    else \
+	      printf "\033[31moffline\033[0m"; \
+	    fi; \
+	    printf "\n"; \
+	  done; \
+	else \
+	  printf "  \033[33m! No hostfile at $(HOSTFILE)\033[0m\n"; \
+	fi
+	@printf "\n  \033[2mTip: make purge-models  → kill + free  |  make kill-all  → kill only\033[0m\n\n"
 
 # =============================================================================
 # Help
@@ -112,8 +177,47 @@ sync: $(VENV_PYTHON) ## Pull latest git changes on all nodes and verify commit a
 	@HOSTFILE=$(HOSTFILE) ./scripts/sync_nodes.sh
 
 # =============================================================================
-# RDMA tests
+# RDMA diagnostics & tests
 # =============================================================================
+
+.PHONY: rdma-diag
+rdma-diag: ## RDMA diagnostics: list all ports, link state, and active devices on all nodes
+	@printf "\n\033[1m  RDMA Diagnostics — all nodes\033[0m\n\n"
+	@if [ -f "$(HOSTFILE)" ]; then \
+	  HOSTS=$$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('$(HOSTFILE)'))))"); \
+	  for h in $$HOSTS; do \
+	    printf "  \033[1m%-22s\033[0m\n" "$$h"; \
+	    printf "  %-22s" ""; \
+	    ONLINE=$$(ssh -o ConnectTimeout=3 "$$h" 'echo 1' 2>/dev/null || echo 0); \
+	    if [ "$$ONLINE" != "1" ]; then \
+	      printf "\033[31m● offline — cannot reach via SSH\033[0m\n\n"; \
+	      continue; \
+	    fi; \
+	    printf "\033[32m● online\033[0m\n"; \
+	    DEVS=$$(ssh "$$h" 'ibv_devinfo 2>/dev/null | grep "hca_id:" | awk "{print \$$2}"' 2>/dev/null); \
+	    if [ -z "$$DEVS" ]; then \
+	      printf "  %-22s \033[33mno RDMA devices found (ibv_devinfo empty)\033[0m\n\n" ""; \
+	      continue; \
+	    fi; \
+	    ACTIVE=0; DOWN=0; \
+	    for dev in $$DEVS; do \
+	      STATE=$$(ssh "$$h" "ibv_devinfo -d $$dev 2>/dev/null | grep 'state:' | awk '{print \$$2}'" 2>/dev/null); \
+	      TRANSPORT=$$(ssh "$$h" "ibv_devinfo -d $$dev 2>/dev/null | grep 'transport:' | head -1 | awk '{print \$$2}'" 2>/dev/null); \
+	      MTU=$$(ssh "$$h" "ibv_devinfo -d $$dev 2>/dev/null | grep 'active_mtu:' | awk '{print \$$2}'" 2>/dev/null); \
+	      if [ "$$STATE" = "PORT_ACTIVE" ]; then \
+	        printf "    \033[32m●\033[0m %-14s %s  mtu=%s  \033[32m%s\033[0m\n" "$$dev" "$$TRANSPORT" "$$MTU" "$$STATE"; \
+	        ACTIVE=$$((ACTIVE+1)); \
+	      else \
+	        printf "    \033[2m○\033[0m %-14s %s  mtu=%s  \033[2m%s\033[0m\n" "$$dev" "$$TRANSPORT" "$$MTU" "$$STATE"; \
+	        DOWN=$$((DOWN+1)); \
+	      fi; \
+	    done; \
+	    printf "  %-22s \033[32m$$ACTIVE active\033[0m  \033[2m$$DOWN down\033[0m\n\n" ""; \
+	  done; \
+	else \
+	  printf "  \033[33m! No hostfile at $(HOSTFILE)\033[0m\n\n"; \
+	fi
+	@printf "  \033[2mTip: make rdma-quick  → smoke test  |  make rdma-test  → full test  |  make rdma-stress  → stress test\033[0m\n\n"
 
 .PHONY: rdma-test
 rdma-test: $(MLX_LAUNCH) ## Run RDMA connectivity + bandwidth test (no model needed)
@@ -163,12 +267,13 @@ rdma-verbose: $(MLX_LAUNCH) ## RDMA test with per-round timing output
 # =============================================================================
 
 .PHONY: bench
-bench: $(MLX_LAUNCH) ## Run distributed tokens/sec benchmark (requires MODEL_DIR)
-ifndef MODEL_DIR
-	@printf "\033[31m  ✗ MODEL_DIR is required.\033[0m\n"
-	@printf "  Usage: MODEL_DIR=~/models_mlx/Qwen3-4B make bench\n\n"
-	@exit 1
-endif
+bench: $(MLX_LAUNCH) _resolve-model _guard-mlx ## Run distributed benchmark (MODEL or MODEL_DIR)
+	@if [ -z "$(MODEL_DIR)" ]; then \
+	  printf "\033[31m  ✗ MODEL or MODEL_DIR is required.\033[0m\n"; \
+	  printf "  Usage: MODEL=mlx-community/Qwen3-8B-4bit make bench\n"; \
+	  printf "         MODEL_DIR=~/models_mlx/Qwen3-8B-4bit make bench\n\n"; \
+	  exit 1; \
+	fi
 	BENCH_RUNS=$(BENCH_RUNS) \
 	BENCH_WARMUP=$(BENCH_WARMUP) \
 	BENCH_VERBOSE=$(BENCH_VERBOSE) \
@@ -189,12 +294,13 @@ endif
 # =============================================================================
 
 .PHONY: server
-server: $(MLX_LAUNCH) ## Start the OpenAI-compatible cluster server (requires MODEL_DIR)
-ifndef MODEL_DIR
-	@printf "\033[31m  ✗ MODEL_DIR is required.\033[0m\n"
-	@printf "  Usage: MODEL_DIR=~/models_mlx/Qwen3-4B make server\n\n"
-	@exit 1
-endif
+server: $(MLX_LAUNCH) _resolve-model _guard-mlx ## Start OpenAI-compatible cluster server (MODEL or MODEL_DIR)
+	@if [ -z "$(MODEL_DIR)" ]; then \
+	  printf "\033[31m  ✗ MODEL or MODEL_DIR is required.\033[0m\n"; \
+	  printf "  Usage: MODEL=mlx-community/Qwen3-8B-4bit make server\n"; \
+	  printf "         MODEL_DIR=~/models_mlx/Qwen3-8B-4bit make server\n\n"; \
+	  exit 1; \
+	fi
 	MODEL_DIR=$(MODEL_DIR) \
 	HOSTFILE=$(HOSTFILE) \
 	HTTP_HOST=$(HTTP_HOST) \
@@ -209,7 +315,7 @@ server-stop: ## Stop the cluster server on all nodes
 	@HOSTFILE=$(HOSTFILE) ./scripts/stop_openai_cluster_server.sh
 
 .PHONY: server-restart
-server-restart: server-stop server ## Restart the cluster server (requires MODEL_DIR)
+server-restart: server-stop _resolve-model _guard-mlx server ## Restart the cluster server (MODEL or MODEL_DIR)
 
 # =============================================================================
 # Model Management
@@ -420,22 +526,129 @@ logs: ## Tail server logs on rank 0 (requires server running via nohup or redire
 # =============================================================================
 # Utilities
 # =============================================================================
+#  _MLX_KILL_PAT: specific script/binary names so we never match ourselves
+# =============================================================================
+_MLX_KILL_PAT := mlx.launch|jaccl_tps_bench|openai_cluster_server|mlx_lm.server
 
 .PHONY: kill-all
-kill-all: ## Kill all MLX/server processes on all nodes (emergency stop)
-	@printf "  Killing all MLX processes on all nodes...\n"
-	@if [ -f "$(HOSTFILE)" ]; then \
+kill-all: ## Kill all MLX/server processes on all nodes (graceful → force)
+	@printf "\n\033[1m  Emergency Stop — all nodes\033[0m\n\n"
+	@_kill_node() { \
+	  host="$$1"; \
+	  printf "  → %-22s " "$$host"; \
+	  COUNT=$$(ssh "$$host" 'pgrep -cf "$(_MLX_KILL_PAT)" 2>/dev/null || echo 0'); \
+	  if [ "$$COUNT" = "0" ] || [ -z "$$COUNT" ]; then \
+	    printf "\033[2mno processes\033[0m\n"; \
+	    return 0; \
+	  fi; \
+	  printf "\033[33m$$COUNT proc(s)\033[0m → SIGTERM… "; \
+	  ssh "$$host" 'pkill -f "$(_MLX_KILL_PAT)" 2>/dev/null || true'; \
+	  sleep 3; \
+	  LEFT=$$(ssh "$$host" 'pgrep -cf "$(_MLX_KILL_PAT)" 2>/dev/null || echo 0'); \
+	  if [ "$$LEFT" != "0" ] && [ -n "$$LEFT" ]; then \
+	    printf "\033[31m$$LEFT still alive → SIGKILL… \033[0m"; \
+	    ssh "$$host" 'pkill -9 -f "$(_MLX_KILL_PAT)" 2>/dev/null || true'; \
+	    printf "waiting for RDMA cleanup… "; \
+	    sleep 5; \
+	  fi; \
+	  printf "\033[32m✓ clean\033[0m\n"; \
+	}; \
+	if [ -f "$(HOSTFILE)" ]; then \
 	  HOSTS=$$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('$(HOSTFILE)'))))"); \
 	  for h in $$HOSTS; do \
-	    printf "  → %-26s " "$$h"; \
-	    ssh "$$h" 'pkill -f "python.*mlx\|openai_cluster_server\|mlx.launch" 2>/dev/null || true' 2>/dev/null; \
-	    printf "done\n"; \
+	    _kill_node "$$h"; \
 	  done; \
 	else \
-	  printf "\033[33m  ! No hostfile found, killing local processes only\033[0m\n"; \
-	  pkill -f "python.*mlx\|openai_cluster_server\|mlx.launch" 2>/dev/null || true; \
+	  printf "\033[33m  ! No hostfile — local only\033[0m\n"; \
+	  pkill -f '$(_MLX_KILL_PAT)' 2>/dev/null || true; \
+	  sleep 3; \
+	  pkill -9 -f '$(_MLX_KILL_PAT)' 2>/dev/null || true; \
 	fi
-	@printf "  Done.\n"
+	@printf "\n  Done.\n\n"
+
+.PHONY: purge-models
+purge-models: ## Kill MLX processes + flush model memory from RAM on all nodes
+	@printf "\n\033[1m  Purge Models — free all MLX/model memory\033[0m\n\n"
+	@$(MAKE) --no-print-directory kill-all
+	@printf "  Memory status on all nodes...\n\n"
+	@_show_mem() { \
+	  host="$$1"; \
+	  printf "  → %-22s " "$$host"; \
+	  MEM=$$(ssh "$$host" 'vm_stat 2>/dev/null | awk "/Pages free/ {gsub(/\\./, \"\"); printf \"%.1f\", \$$3 * 16384 / 1073741824}"' 2>/dev/null); \
+	  TOTAL=$$(ssh "$$host" 'sysctl -n hw.memsize 2>/dev/null | awk "{printf \"%.0f\", \$$1 / 1073741824}"' 2>/dev/null); \
+	  if [ -n "$$MEM" ] && [ -n "$$TOTAL" ]; then \
+	    printf "free: %s GB / %s GB  \033[32m✓\033[0m\n" "$$MEM" "$$TOTAL"; \
+	  else \
+	    printf "\033[33mcould not read memory\033[0m\n"; \
+	  fi; \
+	}; \
+	if [ -f "$(HOSTFILE)" ]; then \
+	  HOSTS=$$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('$(HOSTFILE)'))))"); \
+	  for h in $$HOSTS; do \
+	    _show_mem "$$h"; \
+	  done; \
+	else \
+	  printf "\033[33m  ! No hostfile — local only\033[0m\n"; \
+	fi
+	@printf "\n  \033[32m✓ All MLX processes killed — model memory freed.\033[0m\n"
+	@printf "  \033[2mNote: macOS may keep file cache in RAM until needed.\033[0m\n"
+	@printf "  \033[2mRun 'sudo purge' on each node to also flush disk cache.\033[0m\n"
+	@printf "  Models on disk untouched (~/models_mlx/).\n"
+	@printf "  Re-run bench or server to reload.\n\n"
+
+# macmon binary: local = macmon, remote = /opt/homebrew/bin/macmon
+_MACMON_LOCAL  := macmon
+_MACMON_REMOTE := /opt/homebrew/bin/macmon
+
+# Helper: get one JSON sample from a host.  $1 = ssh host (or "local")
+# Usage in shell: JSON=$$(_macmon_sample "mac2")
+#   local node:  macmon pipe -s 1
+#   remote node: ssh host '/opt/homebrew/bin/macmon pipe -s 1'
+
+_MACMON_FMT := python3 scripts/macmon_fmt.py
+
+.PHONY: hw-snap
+hw-snap: ## One-shot hardware snapshot on all nodes (CPU, GPU, temp, power, RAM)
+	@printf "\n\033[1m  Hardware Snapshot — all nodes (macmon)\033[0m\n\n"
+	@_snap() { \
+	  host="$$1"; \
+	  if [ "$$host" = "mac.home" ] || [ "$$host" = "$$(hostname)" ]; then \
+	    $(_MACMON_LOCAL) pipe -s 1 -i 200 2>/dev/null | $(_MACMON_FMT) --mode snap --host "$$host"; \
+	  else \
+	    ssh "$$host" '$(_MACMON_REMOTE) pipe -s 1 -i 200 2>/dev/null' 2>/dev/null | $(_MACMON_FMT) --mode snap --host "$$host"; \
+	  fi; \
+	}; \
+	if [ -f "$(HOSTFILE)" ]; then \
+	  HOSTS=$$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('$(HOSTFILE)'))))"); \
+	  for h in $$HOSTS; do _snap "$$h"; done; \
+	else \
+	  _snap "$$(hostname)"; \
+	fi
+
+.PHONY: hw-monitor
+hw-monitor: ## Live hardware monitor on all nodes — refreshes every MACMON_INTERVAL ms
+	@printf "\n\033[1m  Hardware Monitor — all nodes (macmon)\033[0m\n"
+	@printf "  Refreshing every $(MACMON_INTERVAL)ms — Ctrl+C to stop\n"
+	@printf "  ─────────────────────────────────────────────────────────────────\n"
+	@if [ -f "$(HOSTFILE)" ]; then \
+	  HOSTS=$$(python3 -c "import json; print(' '.join(h['ssh'] for h in json.load(open('$(HOSTFILE)'))))"); \
+	else \
+	  HOSTS="$$(hostname)"; \
+	fi; \
+	SLEEP_SEC=$$(python3 -c "print($(MACMON_INTERVAL)/1000)"); \
+	while true; do \
+	  printf "\033[2J\033[H"; \
+	  printf "\033[1m  Hardware Monitor\033[0m  \033[2m%s\033[0m\n\n" "$$(date '+%H:%M:%S')"; \
+	  for h in $$HOSTS; do \
+	    if [ "$$h" = "mac.home" ] || [ "$$h" = "$$(hostname)" ]; then \
+	      $(_MACMON_LOCAL) pipe -s 1 -i 200 2>/dev/null | $(_MACMON_FMT) --mode line --host "$$h"; \
+	    else \
+	      ssh "$$h" '$(_MACMON_REMOTE) pipe -s 1 -i 200 2>/dev/null' 2>/dev/null | $(_MACMON_FMT) --mode line --host "$$h"; \
+	    fi; \
+	  done; \
+	  printf "  \033[2mCtrl+C to stop\033[0m"; \
+	  sleep $$SLEEP_SEC; \
+	done
 
 .PHONY: fingerprint
 fingerprint: $(VENV_PYTHON) ## Print hardware + software fingerprint for this node

@@ -236,25 +236,52 @@ def _load_hostfile():
 # ============================================================================
 def load_model_sharded(model_path, world):
     """
-    Load and shard the model manually with proper distributed barriers.
+    Load and shard the model using EAGER (non-lazy) weight loading.
 
-    Why not use mlx_lm.utils.sharded_load?
-      sharded_load() calls mx.eval(model.parameters()) without a barrier.
-      With JACCL, if one rank reaches eval before the other, the implicit
-      distributed ops in the sharded computation graph deadlock.
-      Our fix: barrier before eval so both ranks enter simultaneously.
+    Why eager instead of lazy?
+      lazy=True + mx.eval(model.parameters()) triggers a distributed
+      computation graph that deadlocks in JACCL — rank 1 hangs inside
+      mx.eval() even with barriers. Eager loading materializes weights
+      from disk immediately (no mx.eval needed), then shard() just
+      redistributes the already-concrete tensors. This completely
+      sidesteps the JACCL eval deadlock.
+
+    Memory note:
+      Each node briefly holds the full model (~4.3 GB) before shard()
+      drops non-local slices. Fine for 48 GB machines.
 
     Returns: (model, tokenizer, strategy_str)
     """
+    rank = world.rank()
     model_path = Path(model_path)
 
-    # Step 1: lazy load model structure (no weights)
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    # Step 1: EAGER load — weights are fully materialized from disk, no lazy graph
+    print(f"    [rank {rank}] step 1: load_model(eager) ...", flush=True)
+    t0 = time.perf_counter()
+    model, _ = load_model(model_path, lazy=False)
+    print(
+        f"    [rank {rank}] step 1: done in {time.perf_counter() - t0:.2f}s",
+        flush=True,
+    )
 
-    # Step 2: detect and apply sharding strategy
+    # Step 2: barrier — ensure both ranks loaded before sharding
+    print(f"    [rank {rank}] step 2: pre-shard barrier ...", flush=True)
+    t0 = time.perf_counter()
+    _barrier(world)
+    print(
+        f"    [rank {rank}] step 2: barrier done in {time.perf_counter() - t0:.4f}s",
+        flush=True,
+    )
+
+    # Step 3: detect and apply sharding strategy
     has_tp = hasattr(model, "shard")
     has_pp = hasattr(getattr(model, "model", None), "pipeline")
 
+    print(
+        f"    [rank {rank}] step 3: shard (has_tp={has_tp}, has_pp={has_pp}) ...",
+        flush=True,
+    )
+    t0 = time.perf_counter()
     if has_tp:
         model.shard(world)
         strategy = "Tensor Parallelism"
@@ -263,18 +290,28 @@ def load_model_sharded(model_path, world):
         strategy = "Pipeline Parallelism"
     else:
         strategy = "None (replicated)"
+    print(
+        f"    [rank {rank}] step 3: done in {time.perf_counter() - t0:.2f}s — {strategy}",
+        flush=True,
+    )
 
-    # Step 3: BARRIER — critical for JACCL to avoid deadlock
+    # Step 4: post-shard barrier — both ranks ready before inference
+    print(f"    [rank {rank}] step 4: post-shard barrier ...", flush=True)
+    t0 = time.perf_counter()
     _barrier(world)
+    print(
+        f"    [rank {rank}] step 4: barrier done in {time.perf_counter() - t0:.4f}s",
+        flush=True,
+    )
 
-    # Step 4: materialize weights (both ranks enter simultaneously)
-    mx.eval(model.parameters())
-
-    # Step 5: post-eval sync
-    _barrier(world)
-
-    # Step 6: load tokenizer
+    # Step 5: load tokenizer
+    print(f"    [rank {rank}] step 5: load_tokenizer ...", flush=True)
+    t0 = time.perf_counter()
     tok = load_tokenizer(model_path, {"trust_remote_code": True}, eos_token_ids=None)
+    print(
+        f"    [rank {rank}] step 5: done in {time.perf_counter() - t0:.2f}s",
+        flush=True,
+    )
 
     return model, tok, strategy
 
