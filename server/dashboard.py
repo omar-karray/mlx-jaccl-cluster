@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import socket
 import subprocess
 import threading
@@ -126,6 +127,13 @@ class HardwarePoller:
     Runs in a background daemon thread, stores latest metrics per host.
     """
 
+    # Common Homebrew / Cargo paths where macmon may live
+    _MACMON_SEARCH_PATHS = [
+        "/opt/homebrew/bin/macmon",
+        "/usr/local/bin/macmon",
+        os.path.expanduser("~/.cargo/bin/macmon"),
+    ]
+
     def __init__(
         self,
         hostfile: str = "",
@@ -138,6 +146,25 @@ class HardwarePoller:
         self._hosts: list[dict] = []
         self._local_hostname = socket.gethostname()
         self._started = False
+
+        # Resolve full path to macmon (bare "macmon" may not be in PATH
+        # inside SSH sessions spawned by mlx.launch)
+        self._macmon_bin = shutil.which("macmon") or ""
+        if not self._macmon_bin:
+            for p in self._MACMON_SEARCH_PATHS:
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    self._macmon_bin = p
+                    break
+        if self._macmon_bin:
+            print(f"[hw-poller] macmon resolved → {self._macmon_bin}", flush=True)
+        else:
+            print(
+                "[hw-poller] WARNING: macmon not found — hardware metrics will be unavailable",
+                flush=True,
+            )
+
+        # Resolve the full path for remote nodes too (assume same install path)
+        self._macmon_remote = self._macmon_bin or "macmon"
 
         # Parse hostfile
         if hostfile and os.path.isfile(hostfile):
@@ -160,13 +187,16 @@ class HardwarePoller:
             time.sleep(self._interval)
 
     def _is_local(self, ssh_host: str) -> bool:
-        return ssh_host in (
-            self._local_hostname,
-            "localhost",
-            "127.0.0.1",
-            "mac.home",
-            socket.gethostname(),
-        )
+        # Compare against local hostname variants (strip .local / .home suffixes)
+        local = self._local_hostname.lower()
+        target = ssh_host.lower()
+        # Direct matches
+        if target in (local, "localhost", "127.0.0.1"):
+            return True
+        # Match with common mDNS suffixes: "mac.home" == "mac", "mac.local" == "mac"
+        local_base = local.split(".")[0]
+        target_base = target.split(".")[0]
+        return local_base == target_base
 
     def _poll_all(self) -> None:
         if not self._hosts:
@@ -184,15 +214,20 @@ class HardwarePoller:
     def _poll_node(self, host: str, local: bool = False) -> None:
         try:
             if local:
+                if not self._macmon_bin:
+                    return
                 result = subprocess.run(
-                    ["macmon", "pipe", "-s", "1", "-i", "200"],
+                    [self._macmon_bin, "pipe", "-s", "1", "-i", "200"],
                     capture_output=True,
                     text=True,
                     timeout=4,
                 )
             else:
+                # Use full path on remote node — SSH sessions often lack
+                # /opt/homebrew/bin in PATH
+                remote_cmd = f"{self._macmon_remote} pipe -s 1 -i 200"
                 result = subprocess.run(
-                    ["ssh", "-o", "ConnectTimeout=3", host, "macmon pipe -s 1 -i 200"],
+                    ["ssh", "-o", "ConnectTimeout=3", host, remote_cmd],
                     capture_output=True,
                     text=True,
                     timeout=6,
@@ -220,8 +255,13 @@ class HardwarePoller:
             with self._lock:
                 self._data[host] = parsed
 
-        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
+        except Exception as exc:
+            # Log unexpected errors once to help debug
+            import traceback
+
+            traceback.print_exc()
 
     def _parse(self, data: dict) -> dict:
         gpu_usage_raw = data.get("gpu_usage", [0, 0])
