@@ -17,61 +17,49 @@ HOSTFILE="${HOSTFILE:-$REPO_DIR/hostfiles/hosts-2node.json}"
 VENV_PYTHON="$REPO_DIR/.venv/bin/python"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-CYAN="\033[36m"
-BOLD="\033[1m"
-DIM="\033[2m"
-RESET="\033[0m"
+G="\033[32m"   # green
+R="\033[31m"   # red
+Y="\033[33m"   # yellow
+C="\033[36m"   # cyan
+B="\033[1m"    # bold
+D="\033[2m"    # dim
+X="\033[0m"    # reset
 
-ok()   { printf "${GREEN}✓${RESET} %s\n" "$*"; }
-warn() { printf "${YELLOW}!${RESET} %s\n" "$*"; }
-err()  { printf "${RED}✗${RESET} %s\n" "$*"; }
-sep()  { printf "${DIM}%s${RESET}\n" "────────────────────────────────────────────────────────────────────────────"; }
+sep() { printf "${D}%s${X}\n" "────────────────────────────────────────────────────────────────────────────────"; }
 
-# ── Validate inputs ───────────────────────────────────────────────────────────
+# ── Validate ──────────────────────────────────────────────────────────────────
 if [[ ! -f "$HOSTFILE" ]]; then
-  err "Hostfile not found: $HOSTFILE"
-  exit 1
+  printf "${R}✗${X} Hostfile not found: %s\n" "$HOSTFILE"; exit 1
 fi
-
 if [[ ! -f "$VENV_PYTHON" ]]; then
-  err ".venv not found at $REPO_DIR/.venv"
-  err "Run: ./scripts/setup.sh first"
-  exit 1
+  printf "${R}✗${X} .venv not found — run ./scripts/setup.sh first\n"; exit 1
 fi
 
-# ── Parse hostfile ────────────────────────────────────────────────────────────
-HOSTS=$("$VENV_PYTHON" -c "
+# ── Parse hosts from hostfile ─────────────────────────────────────────────────
+mapfile -t HOSTS < <("$VENV_PYTHON" -c "
 import json
 with open('$HOSTFILE') as f:
     hosts = json.load(f)
-print(' '.join(h['ssh'] for h in hosts))
+for h in hosts:
+    print(h['ssh'])
 ")
 
-# Compute relative path from HOME to REPO_DIR (works on both Macs if same username)
+NUM_HOSTS=${#HOSTS[@]}
+
+# Relative path from HOME to REPO_DIR (same on both Macs — same username)
 REPO_REL=$(python3 -c "import os; print(os.path.relpath('$REPO_DIR', os.path.expanduser('~')))")
 
-# ── Probe script — runs on each remote node via SSH ───────────────────────────
-# NOTE: single-quoted heredoc so local variables are NOT expanded.
-#       We pass REPO_REL as an env var via SSH to avoid quoting issues.
-build_probe() {
-  local repo_rel="$1"
-  cat <<'PROBE_EOF'
-set -uo pipefail
-
+# ── Probe script ──────────────────────────────────────────────────────────────
+# Echoes key=value lines. Uses no associative arrays, no awk $2.
+# REPO_REL is injected via SSH env.
+PROBE=$(cat <<'PROBE_EOF'
 REPO="$HOME/$REPO_REL"
 VENV="$REPO/.venv/bin/python"
 
-# system_profiler helper — uses grep + sed to avoid awk $2 issues
 sp() {
   local key="$1"
   system_profiler SPHardwareDataType 2>/dev/null \
-    | grep "$key" \
-    | sed 's/.*: //' \
-    | head -1 \
-    | xargs
+    | grep "$key" | sed 's/.*: //' | head -1 | xargs
 }
 
 echo "hostname=$(hostname)"
@@ -91,16 +79,20 @@ try:
     wset_gb = d["max_recommended_working_set_size"] / (1024**3)
     buf_gb  = d["max_buffer_length"] / (1024**3)
     print("mlx_version=" + mx.__version__)
-    print("gpu=" + d.get("device_name","unknown"))
-    print("arch=" + d.get("architecture","unknown"))
-    print("memory_gb=" + str(round(mem_gb)))
-    print("wset_gb="   + str(round(wset_gb, 1)))
-    print("buf_gb="    + str(round(buf_gb,  1)))
-    print("python="    + sys.version.split()[0])
+    print("gpu="         + d.get("device_name","unknown"))
+    print("arch="        + d.get("architecture","unknown"))
+    print("memory_gb="   + str(round(mem_gb)))
+    print("wset_gb="     + str(round(wset_gb,1)))
+    print("buf_gb="      + str(round(buf_gb,1)))
+    print("python="      + sys.version.split()[0])
 except Exception as e:
-    print("mlx_error=" + str(e))
-    print("mlx_version=ERROR")
-    print("python=" + sys.version.split()[0])
+    print("mlx_version=ERROR:" + str(e))
+    print("python="      + sys.version.split()[0])
+    print("gpu=ERROR")
+    print("arch=ERROR")
+    print("memory_gb=ERROR")
+    print("wset_gb=ERROR")
+    print("buf_gb=ERROR")
 PYEOF
 else
   echo "mlx_version=NOT_INSTALLED"
@@ -112,16 +104,14 @@ else
   echo "buf_gb=N/A"
 fi
 
-# RDMA
 if command -v ibv_devices &>/dev/null; then
-  DEVS=$(ibv_devices 2>/dev/null | grep -c "rdma_en" || true)
+  DEVS=$(ibv_devices 2>/dev/null | grep -c "rdma_en" || echo 0)
   ACTIVE=$(ibv_devinfo 2>/dev/null \
     | grep -E "hca_id|PORT_ACTIVE" \
     | grep -B1 "PORT_ACTIVE" \
     | grep "hca_id" \
     | sed 's/.*hca_id:[[:space:]]*//' \
-    | tr '\n' ',' \
-    | sed 's/,$//')
+    | tr '\n' ',' | sed 's/,$//')
   echo "rdma_devices=$DEVS"
   echo "rdma_active=${ACTIVE:-none}"
 else
@@ -129,37 +119,44 @@ else
   echo "rdma_active=none"
 fi
 
-# mlx.launch
 if [[ -f "$REPO/.venv/bin/mlx.launch" ]]; then
   echo "mlx_launch=present"
 else
   echo "mlx_launch=MISSING"
 fi
 PROBE_EOF
-}
+)
 
-# ── Collect data from all nodes ───────────────────────────────────────────────
-printf "\n${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
-printf "${BOLD}  MLX JACCL Cluster — Node Alignment Report${RESET}\n"
-printf "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
-printf "  Hostfile : ${DIM}%s${RESET}\n" "$HOSTFILE"
-printf "  Nodes    : ${DIM}%s${RESET}\n" "$HOSTS"
+# ── Header ────────────────────────────────────────────────────────────────────
+printf "\n${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${X}\n"
+printf "${B}  MLX JACCL Cluster — Node Alignment Report${X}\n"
+printf "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${X}\n"
+printf "  Hostfile : ${D}%s${X}\n" "$HOSTFILE"
+printf "  Nodes    : ${D}%s${X}\n" "${HOSTS[*]}"
 printf "\n"
 
-PROBE=$(build_probe "$REPO_REL")
+# ── Probe each node — store output in temp files indexed by position ──────────
+TMPDIR_PROBE=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_PROBE"' EXIT
 
-declare -A NODE_DATA
-
-echo "  Probing nodes..."
-for h in $HOSTS; do
-  printf "  ${DIM}→ %-24s${RESET} " "$h"
-  if DATA=$(ssh -o ConnectTimeout=6 -o BatchMode=yes "$h" \
-      "REPO_REL='$REPO_REL' bash -s" <<< "$PROBE" 2>/dev/null); then
-    NODE_DATA["$h"]="$DATA"
-    printf "${GREEN}OK${RESET}\n"
+printf "  Probing nodes...\n"
+for i in "${!HOSTS[@]}"; do
+  h="${HOSTS[$i]}"
+  TMPFILE="$TMPDIR_PROBE/node_${i}.txt"
+  printf "  ${D}→ %-26s${X} " "$h"
+  if ssh -o ConnectTimeout=8 -o BatchMode=yes "$h" \
+       "REPO_REL='$REPO_REL' bash -s" <<< "$PROBE" > "$TMPFILE" 2>/dev/null; then
+    printf "${G}OK${X}\n"
   else
-    NODE_DATA["$h"]="hostname=$h
-error=SSH_FAILED
+    # Write failure sentinel
+    cat > "$TMPFILE" <<FAIL_EOF
+hostname=$h
+model=SSH_FAILED
+chip=SSH_FAILED
+memory=SSH_FAILED
+cores=SSH_FAILED
+macos=SSH_FAILED
+build=SSH_FAILED
 mlx_version=SSH_FAILED
 python=SSH_FAILED
 gpu=SSH_FAILED
@@ -170,83 +167,87 @@ buf_gb=SSH_FAILED
 rdma_devices=0
 rdma_active=none
 mlx_launch=SSH_FAILED
-macos=SSH_FAILED
-build=SSH_FAILED
-chip=SSH_FAILED
-memory=SSH_FAILED
-cores=SSH_FAILED
-model=SSH_FAILED"
-    printf "${RED}FAILED${RESET}\n"
+FAIL_EOF
+    printf "${R}FAILED${X}\n"
   fi
 done
 
-echo ""
+printf "\n"
 
-# ── Helper: extract value from a node's data ─────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+# get <node_index> <key>
 get() {
-  local host="$1" key="$2"
-  echo "${NODE_DATA[$host]}" | grep "^${key}=" | cut -d'=' -f2- | head -1
+  local idx="$1" key="$2"
+  grep "^${key}=" "$TMPDIR_PROBE/node_${idx}.txt" 2>/dev/null \
+    | head -1 | cut -d'=' -f2-
 }
 
-# ── Build side-by-side table ──────────────────────────────────────────────────
-COL_KEY=22
+# get_hostname <node_index>
+get_hn() {
+  local v
+  v=$(get "$1" "hostname")
+  echo "${v:-node_$1}"
+}
+
+COL_KEY=24
 COL_VAL=26
 
-# Header row
-printf "${BOLD}${CYAN}%-${COL_KEY}s${RESET}" "Property"
-for h in $HOSTS; do
-  HN=$(get "$h" "hostname")
-  printf " ${BOLD}${CYAN}%-${COL_VAL}s${RESET}" "${HN:-$h}"
+# ── Table header ──────────────────────────────────────────────────────────────
+printf "${B}${C}%-${COL_KEY}s${X}" "Property"
+for i in "${!HOSTS[@]}"; do
+  printf " ${B}${C}%-${COL_VAL}s${X}" "$(get_hn "$i")"
 done
-echo ""
+printf "\n"
 sep
 
-# ── Print one row ─────────────────────────────────────────────────────────────
+# ── print_row <label> <key> [check_match=true] ────────────────────────────────
 print_row() {
   local label="$1"
   local key="$2"
   local check_match="${3:-true}"
 
-  printf "${DIM}%-${COL_KEY}s${RESET}" "$label"
+  printf "${D}%-${COL_KEY}s${X}" "$label"
 
-  declare -a vals=()
-  for h in $HOSTS; do
-    vals+=("$(get "$h" "$key")")
+  # Collect values
+  local vals=()
+  for i in "${!HOSTS[@]}"; do
+    vals+=("$(get "$i" "$key")")
   done
 
+  # Check if all match
   local first="${vals[0]}"
   local all_match=true
   for v in "${vals[@]}"; do
     [[ "$v" != "$first" ]] && all_match=false && break
   done
 
+  # Print each value
   for v in "${vals[@]}"; do
-    if [[ "$v" == "NOT_INSTALLED" || "$v" == "MISSING" || "$v" == "SSH_FAILED" || "$v" == "ERROR" ]]; then
-      printf " ${RED}%-${COL_VAL}s${RESET}" "$v"
+    if [[ "$v" == *"FAILED"* || "$v" == *"MISSING"* || "$v" == *"NOT_INSTALLED"* || "$v" == "ERROR"* ]]; then
+      printf " ${R}%-${COL_VAL}s${X}" "$v"
     elif [[ "$check_match" == "true" && "$all_match" == "false" ]]; then
-      printf " ${YELLOW}%-${COL_VAL}s${RESET}" "$v"
+      printf " ${Y}%-${COL_VAL}s${X}" "$v"
     else
-      printf " ${GREEN}%-${COL_VAL}s${RESET}" "$v"
+      printf " ${G}%-${COL_VAL}s${X}" "$v"
     fi
   done
 
   if [[ "$check_match" == "true" && "$all_match" == "false" ]]; then
-    printf "  ${YELLOW}⚠ MISMATCH${RESET}"
+    printf "  ${Y}⚠ MISMATCH${X}"
   fi
 
-  echo ""
+  printf "\n"
 }
 
-# ── Table sections ────────────────────────────────────────────────────────────
-
-# Hardware
+# ── Hardware ──────────────────────────────────────────────────────────────────
 print_row "Model"              "model"       false
 print_row "Chip"               "chip"        true
 print_row "Memory"             "memory"      true
 print_row "CPU Cores"          "cores"       false
 sep
 
-# Software
+# ── Software ──────────────────────────────────────────────────────────────────
 print_row "macOS"              "macos"       true
 print_row "macOS Build"        "build"       true
 print_row "Python"             "python"      true
@@ -255,22 +256,20 @@ print_row "GPU"                "gpu"         true
 print_row "Architecture"       "arch"        true
 sep
 
-# Memory / compute capacity
+# ── Compute capacity ──────────────────────────────────────────────────────────
 print_row "Unified RAM (GB)"   "memory_gb"   true
 print_row "Max working set GB" "wset_gb"     true
 print_row "Max buffer GB"      "buf_gb"      true
 sep
 
-# Cluster / RDMA
+# ── RDMA / cluster ────────────────────────────────────────────────────────────
 print_row "RDMA devices"       "rdma_devices" false
 print_row "RDMA active port"   "rdma_active"  false
 print_row "mlx.launch"         "mlx_launch"   true
 sep
 
 # ── Alignment verdict ─────────────────────────────────────────────────────────
-echo ""
-printf "${BOLD}  Alignment Verdict${RESET}\n"
-echo ""
+printf "\n${B}  Alignment Verdict${X}\n\n"
 
 ISSUES=0
 
@@ -278,9 +277,9 @@ check_align() {
   local label="$1"
   local key="$2"
 
-  declare -a vals=()
-  for h in $HOSTS; do
-    vals+=("$(get "$h" "$key")")
+  local vals=()
+  for i in "${!HOSTS[@]}"; do
+    vals+=("$(get "$i" "$key")")
   done
 
   local first="${vals[0]}"
@@ -290,38 +289,39 @@ check_align() {
   done
 
   if [[ "$all_ok" == "true" ]]; then
-    printf "  ${GREEN}✓${RESET}  %-34s ${DIM}%s${RESET}\n" "$label" "$first"
+    printf "  ${G}✓${X}  %-34s ${D}%s${X}\n" "$label" "$first"
   else
-    printf "  ${RED}✗${RESET}  %-34s " "$label"
-    for h in $HOSTS; do
-      HN=$(get "$h" "hostname")
-      V=$(get "$h" "$key")
-      printf "${YELLOW}%s${RESET}=${RED}%s${RESET}  " "${HN:-$h}" "$V"
+    printf "  ${R}✗${X}  %-34s " "$label"
+    for i in "${!HOSTS[@]}"; do
+      local hn v
+      hn=$(get_hn "$i")
+      v=$(get "$i" "$key")
+      printf "${Y}%s${X}=${R}%s${X}  " "$hn" "$v"
     done
-    echo ""
+    printf "\n"
     ISSUES=$((ISSUES + 1))
   fi
 }
 
-check_align "macOS version"      "macos"
-check_align "MLX version"        "mlx_version"
-check_align "Python version"     "python"
-check_align "Chip"               "chip"
-check_align "Unified memory GB"  "memory_gb"
-check_align "Architecture"       "arch"
-check_align "mlx.launch"         "mlx_launch"
+check_align "macOS version"       "macos"
+check_align "MLX version"         "mlx_version"
+check_align "Python version"      "python"
+check_align "Chip"                "chip"
+check_align "Unified memory (GB)" "memory_gb"
+check_align "Architecture"        "arch"
+check_align "mlx.launch"          "mlx_launch"
 
-echo ""
+printf "\n"
 
 if [[ "$ISSUES" -eq 0 ]]; then
-  printf "${BOLD}${GREEN}  ✓ All nodes are aligned — cluster is ready.${RESET}\n"
+  printf "${B}${G}  ✓ All nodes are aligned — cluster is ready.${X}\n"
 else
-  printf "${BOLD}${RED}  ✗ %d alignment issue(s) found — resolve before running inference.${RESET}\n" "$ISSUES"
-  echo ""
-  printf "  ${DIM}Common fixes:${RESET}\n"
-  printf "  ${DIM}  MLX mismatch    → ssh <node> && cd repo && ./scripts/setup.sh${RESET}\n"
-  printf "  ${DIM}  macOS mismatch  → System Settings → Software Update${RESET}\n"
-  printf "  ${DIM}  Python mismatch → rm -rf .venv && ./scripts/setup.sh${RESET}\n"
+  printf "${B}${R}  ✗ %d alignment issue(s) found.${X}\n" "$ISSUES"
+  printf "\n"
+  printf "  ${D}Fixes:${X}\n"
+  printf "  ${D}  MLX mismatch    → ssh <node> 'cd %s && ./scripts/setup.sh'${X}\n" "$REPO_REL"
+  printf "  ${D}  macOS mismatch  → System Settings → Software Update${X}\n"
+  printf "  ${D}  Python mismatch → rm -rf .venv && ./scripts/setup.sh${X}\n"
 fi
 
-printf "\n${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n\n"
+printf "\n${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${X}\n\n"
