@@ -266,7 +266,10 @@ class HardwarePoller:
     def _parse(self, data: dict) -> dict:
         gpu_usage_raw = data.get("gpu_usage", [0, 0])
         gpu_freq = gpu_usage_raw[0] if len(gpu_usage_raw) > 0 else 0
-        gpu_pct = gpu_usage_raw[1] if len(gpu_usage_raw) > 1 else 0
+        # NOTE: gpu_usage[1] is freq/max_freq ratio (always ~1.0 when model loaded),
+        # NOT actual GPU compute utilisation.  Apple Silicon doesn't expose a
+        # direct "GPU busy %" — GPU power draw is the best real-time proxy.
+        gpu_freq_ratio = gpu_usage_raw[1] if len(gpu_usage_raw) > 1 else 0
 
         mem = data.get("memory", {})
         ram_total = mem.get("ram_total", 0)
@@ -274,13 +277,22 @@ class HardwarePoller:
 
         temp = data.get("temp", {})
 
+        gpu_power = round(data.get("gpu_power", 0), 1)
+        # Derive a 0-100 "activity %" from GPU power.
+        # M4 Pro GPU TDP is ~22 W; scale so 20 W → 100 %.
+        GPU_POWER_CEIL = 20.0
+        gpu_activity_pct = (
+            min(100, round((gpu_power / GPU_POWER_CEIL) * 100)) if gpu_power > 0 else 0
+        )
+
         return {
-            "gpu_usage_pct": round(gpu_pct * 100),
+            "gpu_usage_pct": gpu_activity_pct,  # power-based activity
+            "gpu_freq_ratio": round(gpu_freq_ratio * 100),  # clock % (for tooltip)
             "gpu_freq_mhz": gpu_freq,
+            "gpu_power_w": gpu_power,
             "gpu_temp_c": round(temp.get("gpu_temp_avg", 0)),
             "cpu_temp_c": round(temp.get("cpu_temp_avg", 0)),
             "sys_power_w": round(data.get("sys_power", 0), 1),
-            "gpu_power_w": round(data.get("gpu_power", 0), 1),
             "cpu_power_w": round(data.get("cpu_power", 0), 1),
             "ram_used_gb": round(ram_usage / (1024**3), 1),
             "ram_total_gb": round(ram_total / (1024**3), 1),
@@ -485,12 +497,12 @@ def _render_dashboard(
       background: var(--bg);
     }}
     .node-card {{
-      display: flex; align-items: center; gap: 16px;
-      padding: 12px 16px;
+      display: flex; align-items: flex-start; gap: 16px;
+      padding: 14px 16px;
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 12px;
-      min-width: 440px;
+      min-width: 500px;
       transition: border-color 0.3s;
       position: relative;
     }}
@@ -549,25 +561,53 @@ def _render_dashboard(
     }}
     .role-badge.coord {{ background: #2a2210; color: var(--accent); border: 1px solid var(--accent-dim); }}
     .role-badge.worker {{ background: #0d2a22; color: var(--teal); border: 1px solid #1a4a35; }}
-    .node-subtitle {{ font-size: 11px; color: var(--dim); margin-bottom: 8px; }}
+    .node-subtitle {{ font-size: 11px; color: var(--dim); margin-bottom: 6px; }}
 
-    /* Stats row */
-    .node-stats {{
-      display: flex; gap: 12px; align-items: center;
-      font-size: 11px;
+    /* ── Metric tiles grid ── */
+    .metric-tiles {{
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+      margin-bottom: 6px;
     }}
-    .node-stat {{
-      display: flex; align-items: center; gap: 4px;
-      color: var(--text2);
+    .metric-tile {{
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 8px;
+      display: flex; flex-direction: column;
+      align-items: center;
+      gap: 1px;
+      transition: border-color 0.3s;
     }}
-    .node-stat .val {{ font-weight: 700; }}
-    .node-stat .unit {{ color: var(--dim); font-size: 10px; }}
-    .node-stat.hot .val {{ color: var(--orange); }}
-    .node-stat.cool .val {{ color: var(--green); }}
+    .metric-tile:hover {{ border-color: var(--border2); }}
+    .metric-tile .mt-label {{
+      font-size: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--dim);
+      white-space: nowrap;
+    }}
+    .metric-tile .mt-value {{
+      font-size: 16px;
+      font-weight: 800;
+      line-height: 1.1;
+      transition: color 0.3s;
+    }}
+    .metric-tile .mt-unit {{
+      font-size: 9px;
+      color: var(--dim);
+    }}
+    /* Tile color variants */
+    .metric-tile.gpu-pw .mt-value {{ color: var(--accent); }}
+    .metric-tile.temp .mt-value  {{ color: var(--green); }}
+    .metric-tile.temp.hot .mt-value {{ color: var(--orange); }}
+    .metric-tile.sys-pw .mt-value {{ color: var(--blue); }}
+    .metric-tile.freq .mt-value  {{ color: var(--teal); }}
 
-    /* Memory bar */
+    /* ── Memory bar ── */
     .mem-bar-row {{
-      display: flex; align-items: center; gap: 8px; margin-top: 6px;
+      display: flex; align-items: center; gap: 8px;
     }}
     .mem-bar-label {{ font-size: 10px; color: var(--dim); min-width: 80px; }}
     .mem-bar-wrap {{
@@ -1034,7 +1074,7 @@ function buildTopology() {{
       <div class="mac-mini-icon">
         <div class="screen">
           <div class="gpu-bar" id="gpu-bar-${{node.rank}}" style="width:0%"></div>
-          <span class="gpu-text" id="gpu-text-${{node.rank}}">0%</span>
+          <span class="gpu-text" id="gpu-text-${{node.rank}}">—W</span>
         </div>
       </div>
       <div class="node-info">
@@ -1043,10 +1083,27 @@ function buildTopology() {{
           <span class="role-badge ${{roleClass}}">${{node.role}}</span>
         </div>
         <div class="node-subtitle">rank ${{node.rank}} · rdma: ${{node.rdma}}</div>
-        <div class="node-stats">
-          <div class="node-stat" id="stat-temp-${{node.rank}}">🌡 <span class="val">—</span><span class="unit">°C</span></div>
-          <div class="node-stat" id="stat-power-${{node.rank}}">⚡ <span class="val">—</span><span class="unit">W</span></div>
-          <div class="node-stat" id="stat-gpu-${{node.rank}}">🎮 <span class="val">—</span><span class="unit">%</span></div>
+        <div class="metric-tiles">
+          <div class="metric-tile gpu-pw" id="tile-gpupw-${{node.rank}}">
+            <span class="mt-label">GPU Power</span>
+            <span class="mt-value" id="val-gpupw-${{node.rank}}">—</span>
+            <span class="mt-unit">watts</span>
+          </div>
+          <div class="metric-tile temp" id="tile-temp-${{node.rank}}">
+            <span class="mt-label">GPU Temp</span>
+            <span class="mt-value" id="val-temp-${{node.rank}}">—</span>
+            <span class="mt-unit">°C</span>
+          </div>
+          <div class="metric-tile sys-pw" id="tile-syspw-${{node.rank}}">
+            <span class="mt-label">System</span>
+            <span class="mt-value" id="val-syspw-${{node.rank}}">—</span>
+            <span class="mt-unit">watts</span>
+          </div>
+          <div class="metric-tile freq" id="tile-freq-${{node.rank}}">
+            <span class="mt-label">GPU Clock</span>
+            <span class="mt-value" id="val-freq-${{node.rank}}">—</span>
+            <span class="mt-unit">MHz</span>
+          </div>
         </div>
         <div class="mem-bar-row">
           <span class="mem-bar-label" id="mem-label-${{node.rank}}">—/— GB</span>
@@ -1080,36 +1137,46 @@ buildTopology();
 function updateNodeHW(nodeSSH, rank, hw) {{
   if (!hw) return;
 
-  // GPU bar + text
+  // ── Mac Mini screen: GPU power bar + watt label ──
   const gpuBar = document.getElementById('gpu-bar-' + rank);
   const gpuText = document.getElementById('gpu-text-' + rank);
   if (gpuBar && gpuText) {{
-    const gpuPct = hw.gpu_usage_pct || 0;
-    gpuBar.style.width = gpuPct + '%';
-    gpuText.textContent = gpuPct + '%';
+    const actPct = hw.gpu_usage_pct || 0;
+    const gpuW   = hw.gpu_power_w   ?? 0;
+    gpuBar.style.width = actPct + '%';
+    gpuBar.style.background = actPct > 60 ? 'var(--orange)' : 'var(--accent)';
+    gpuText.textContent = gpuW + 'W';
   }}
 
-  // Temperature
-  const tempEl = document.getElementById('stat-temp-' + rank);
-  if (tempEl && hw.gpu_temp_c !== undefined) {{
-    const t = hw.gpu_temp_c;
-    tempEl.querySelector('.val').textContent = t;
-    tempEl.className = 'node-stat ' + (t > 70 ? 'hot' : 'cool');
+  // ── Tile: GPU Power ──
+  const gpuPwVal = document.getElementById('val-gpupw-' + rank);
+  if (gpuPwVal && hw.gpu_power_w !== undefined) {{
+    gpuPwVal.textContent = hw.gpu_power_w;
   }}
 
-  // Power
-  const powerEl = document.getElementById('stat-power-' + rank);
-  if (powerEl && hw.sys_power_w !== undefined) {{
-    powerEl.querySelector('.val').textContent = hw.sys_power_w;
+  // ── Tile: GPU Temp ──
+  const tempVal = document.getElementById('val-temp-' + rank);
+  const tempTile = document.getElementById('tile-temp-' + rank);
+  if (tempVal && hw.gpu_temp_c !== undefined) {{
+    tempVal.textContent = hw.gpu_temp_c;
+    if (tempTile) {{
+      tempTile.classList.toggle('hot', hw.gpu_temp_c > 70);
+    }}
   }}
 
-  // GPU usage stat
-  const gpuStatEl = document.getElementById('stat-gpu-' + rank);
-  if (gpuStatEl && hw.gpu_usage_pct !== undefined) {{
-    gpuStatEl.querySelector('.val').textContent = hw.gpu_usage_pct;
+  // ── Tile: System Power ──
+  const sysPwVal = document.getElementById('val-syspw-' + rank);
+  if (sysPwVal && hw.sys_power_w !== undefined) {{
+    sysPwVal.textContent = hw.sys_power_w;
   }}
 
-  // Memory bar
+  // ── Tile: GPU Clock Frequency ──
+  const freqVal = document.getElementById('val-freq-' + rank);
+  if (freqVal && hw.gpu_freq_mhz !== undefined) {{
+    freqVal.textContent = hw.gpu_freq_mhz;
+  }}
+
+  // ── Memory bar ──
   const memLabel = document.getElementById('mem-label-' + rank);
   const memBar = document.getElementById('mem-bar-' + rank);
   const memPct = document.getElementById('mem-pct-' + rank);
@@ -1117,10 +1184,10 @@ function updateNodeHW(nodeSSH, rank, hw) {{
     const used = hw.ram_used_gb;
     const total = hw.ram_total_gb;
     const pct = hw.ram_pct || 0;
-    memLabel.textContent = used + '/' + total + 'GB';
+    memLabel.textContent = used + '/' + total + ' GB';
     memBar.style.width = pct + '%';
     memBar.className = 'mem-bar ' + (pct > 80 ? 'high' : pct > 50 ? 'mid' : 'low');
-    memPct.textContent = '(' + pct + '%)';
+    memPct.textContent = pct + '%';
   }}
 }}
 
